@@ -15,12 +15,18 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Free disk space
+      - name: Free disk space and move docker to /mnt
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+            /opt/hostedtoolcache /usr/local/share/boost /usr/local/.ghcup \
+            /usr/share/swift /usr/local/julia* /opt/microsoft
           sudo docker system prune -af || true
-          df -h /
+          # the runner's /mnt disk has ~60GB free — put docker's data there
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker-data
+          echo '{"data-root": "/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          df -h / /mnt
 
       - uses: actions/checkout@v4
 
