@@ -101,6 +101,48 @@ the first job if it errors.
 
 Cost reference: a 1-hour video ≈ $0.05–0.09 depending on the GPU.
 
+## Quickstart — SaladCloud (cheapest: consumer GPUs at home)
+
+Salad rents idle gaming PCs (RTX 5090 32GB at $0.25–0.45/hr — a quarter of
+datacenter prices). Measured there: a 10-min video E2E in 41 s; a 30-min video
+in **coherent** mode in 68.6 s ≈ **~1 cent per half hour**.
+
+Deploy `docker/salad/` (built as `ghcr.io/<you>/qwen3vl-analyzer-salad`) as a
+Container Group: 1 replica, GPU class RTX 5090, 8 vCPU / 16 GB RAM / 50 GB
+storage, Container Gateway → port 8100 (auth off — the API has its own Bearer
+key), startup probe HTTP `/health` (`failure_threshold` caps at 20, `headers`
+required). The entrypoint starts the API **before** the model download so the
+probe passes within Salad's ~15-min probe budget.
+
+Salad nodes run containers under **WSL on Windows**, which changes the CUDA
+rules — these cost a full night to learn:
+
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is fatal** — it needs
+  CUDA VMM APIs that WSL doesn't provide. Every engine start dies with
+  `CUDA driver error: device not ready` (plain torch matmul works, which makes
+  it look like anything but an allocator setting). Unset it.
+- **vLLM ≥ 0.25 needs UVA** for its V2 model runner (`UVA is not available`).
+  Pin `vllm/vllm-openai:v0.11.2` (newest line with Qwen3-VL support that runs
+  under WSL; Salad's own vLLM recipe pins v0.10.1 for the same reason) and set
+  `VLLM_USE_V2_MODEL_RUNNER=0`.
+- **WSL taxes VRAM**: the 32 GB profile that fits at `--gpu-memory-utilization
+  0.65` elsewhere needs `0.85` here, with the pixel budget back at 45M
+  (115M leaves no room for KV cache blocks).
+- The gateway only routes to apps listening on **IPv6** — uvicorn binds `::`.
+- The group snapshots the image reference at creation: pushing a new `:latest`
+  does NOT reach new nodes. Update the image with **stop → PATCH → start**
+  (PATCH while running returns 400/no-op).
+- Nodes are a lottery (owner may be gaming on the GPU; some have broken
+  gateway networking; egress varies — one node couldn't reach Google Storage
+  at all). The fix is always **reallocate** — each fresh node pulls the image
+  and model on residential internet (~10–40 min).
+
+Bandwidth-friendly batch pattern: pre-normalize locally
+(`ffmpeg -vf "fps=1,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2" -g 15 -an`
+turns a 650 MB hour into ~40 MB), `scp` the small file to the node, then
+`POST /analyze {"video_path": "...", "coherent": true}` — the node computes
+instead of downloading.
+
 ## Hard-won notes (so you don't re-learn them)
 
 - **CUDA wheel matching**: the default vLLM wheel is built for CUDA 13. On
