@@ -41,7 +41,7 @@ except Exception:
 # ~300 tok/frame @720p): richer temporal context per chunk and fewer chunks
 # (each chunk pays a fixed ~9 s JSON-generation cost).
 DEFAULT_CHUNK = 360 if _vram_mb < 40000 else 600
-DEFAULT_CHUNK_HIGH = 90 if _vram_mb < 40000 else 150
+DEFAULT_CHUNK_HIGH = 80 if _vram_mb < 40000 else 140
 
 app = FastAPI(title="qwen3vl-video-analyzer")
 jobs: dict[str, dict] = {}
