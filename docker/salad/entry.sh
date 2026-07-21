@@ -11,6 +11,13 @@ export LAB_HOME=/root/lab
 # crashes with "UVA is not available"; force the V1 runner.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
+# Salad's SSH bridge reads the container's authorized_keys — plant the lab
+# public key (plus any PUBLIC_KEY env) so every node is reachable for debugging.
+mkdir -p /root/.ssh
+echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAY16+u4TOd5Xb9/EIw+nWJ+JtFtMkOwsO2n5AOjXFjR qwen3vl-lab' >> /root/.ssh/authorized_keys
+if [ -n "$PUBLIC_KEY" ]; then echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys; fi
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+
 mkdir -p $LAB_HOME/videos
 # venv shim so analyzer's/launcher's .venv paths work with the system python
 mkdir -p $LAB_HOME/.venv/bin
