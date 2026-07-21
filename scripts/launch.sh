@@ -2,7 +2,10 @@
 LAB="${LAB_HOME:-/root/lab}"
 cd "$LAB"
 export PATH=$LAB/.venv/bin:/usr/local/cuda/bin:$PATH
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Allocator conf is overridable: expandable segments need CUDA VMM, which
+# WSL-based hosts (SaladCloud) don't provide — there set LAB_ALLOC_CONF="".
+export PYTORCH_CUDA_ALLOC_CONF="${LAB_ALLOC_CONF-expandable_segments:True}"
+[ -z "$PYTORCH_CUDA_ALLOC_CONF" ] && unset PYTORCH_CUDA_ALLOC_CONF
 
 # Blackwell (sm120): flashinfer's CUDA-version check is broken -> pin arch, skip sampler JIT
 CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)
@@ -20,6 +23,9 @@ if [ "$VRAM_MB" -lt 40000 ]; then
 else
   DEF_MAXLEN=150000; UTIL=0.60; BUDGET=150000000
 fi
+# Env overrides (WSL hosts tax VRAM: Salad uses UTIL 0.85 + BUDGET 45M)
+UTIL=${LAB_GPU_UTIL:-$UTIL}
+BUDGET=${LAB_PX_BUDGET:-$BUDGET}
 MAXLEN=${1:-$DEF_MAXLEN}
 
 exec .venv/bin/vllm serve Qwen/Qwen3-VL-8B-Instruct \

@@ -10,6 +10,11 @@ export LAB_HOME=/root/lab
 # Salad's sandboxed runtime has no CUDA UVA -> vLLM's V2 model runner
 # crashes with "UVA is not available"; force the V1 runner.
 export VLLM_USE_V2_MODEL_RUNNER=0
+# WSL host: no CUDA VMM (expandable_segments is fatal) and VRAM is taxed —
+# the proven Salad profile is util 0.85 with the 45M pixel budget.
+export LAB_ALLOC_CONF=""
+export LAB_GPU_UTIL=0.85
+export LAB_PX_BUDGET=45000000
 
 # Salad's SSH bridge reads the container's authorized_keys — plant the lab
 # public key (plus any PUBLIC_KEY env) so every node is reachable for debugging.
