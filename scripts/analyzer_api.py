@@ -30,23 +30,64 @@ JOBS_DIR.mkdir(exist_ok=True)
 FFMPEG = LAB / "bin" / "ffmpeg"
 API_KEY = os.environ.get("LAB_API_KEY", "")
 
-try:
-    _vram_mb = int(subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-        text=True).splitlines()[0])
-except Exception:
-    _vram_mb = 999999
+def _detect_vram_mb() -> int:
+    try:
+        return int(subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"], text=True).splitlines()[0])
+    except Exception:
+        pass
+    try:  # AMD: rocm-smi vram total in bytes
+        out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", "--csv"], text=True)
+        for line in out.splitlines():
+            parts = line.split(",")
+            if len(parts) >= 2 and parts[1].strip().isdigit():
+                return int(int(parts[1]) / 1024 / 1024)
+    except Exception:
+        pass
+    return 999999
+
+
+_vram_mb = _detect_vram_mb()
 # Small cards run a smaller vLLM context (see launch.sh) -> smaller chunks.
 # Chunks are sized to nearly FILL the context (measured: ~100 tok/frame @360p,
 # ~300 tok/frame @720p): richer temporal context per chunk and fewer chunks
 # (each chunk pays a fixed ~9 s JSON-generation cost).
-DEFAULT_CHUNK = 360 if _vram_mb < 40000 else 600
-DEFAULT_CHUNK_HIGH = 80 if _vram_mb < 40000 else 140
+if _vram_mb < 40000:          # RTX 5090-class (45K ctx)
+    DEFAULT_CHUNK, DEFAULT_CHUNK_HIGH = 360, 80
+elif _vram_mb < 150000:       # H200/PRO6000-class (150K ctx)
+    DEFAULT_CHUNK, DEFAULT_CHUNK_HIGH = 600, 140
+else:                         # MI300X-class 192GB (256K ctx, 500M px budget)
+    DEFAULT_CHUNK, DEFAULT_CHUNK_HIGH = 1500, 420
 
 app = FastAPI(title="qwen3vl-video-analyzer")
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 _coherent_counter = {"n": 0}  # round-robins coherent jobs across GPUs
+
+# Batch queue: accept any number of jobs instantly, but only
+# LAB_MAX_CONCURRENT run at once (default 2 = one per GPU); rest wait FIFO.
+import queue as _queue
+_job_queue: "_queue.Queue[tuple]" = _queue.Queue()
+MAX_CONCURRENT = int(os.environ.get("LAB_MAX_CONCURRENT", "2"))
+
+
+def _worker():
+    while True:
+        job_id, req = _job_queue.get()
+        try:
+            run_job(job_id, req)
+        finally:
+            _job_queue.task_done()
+
+
+def _start_workers():
+    for _ in range(MAX_CONCURRENT):
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+_start_workers()
 
 
 class AnalyzeRequest(BaseModel):
@@ -153,9 +194,11 @@ def analyze(req: AnalyzeRequest, authorization: str | None = Header(default=None
     if not req.video_url and not req.video_path:
         raise HTTPException(status_code=422, detail="provide video_url or video_path")
     job_id = uuid.uuid4().hex[:12]
-    set_job(job_id, id=job_id, status="queued", created=time.time())
-    threading.Thread(target=run_job, args=(job_id, req), daemon=True).start()
+    set_job(job_id, id=job_id, status="queued", created=time.time(),
+            queue_position=_job_queue.qsize())
+    _job_queue.put((job_id, req))
     return {"job_id": job_id, "status": "queued",
+            "queue_position": _job_queue.qsize(),
             "poll": f"/result/{job_id}"}
 
 
