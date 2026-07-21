@@ -117,6 +117,8 @@ class AnalyzeRequest(BaseModel):
     chunk_seconds: int | None = None
     limit_seconds: int = 0
     quality: str = "low"  # "low" = 360p (fast), "high" = 720p (fine detail)
+    prompt: str | None = None  # optional user focus/question: steers every
+    #   chunk's attention and adds a direct "user_answer" in the result
     coherent: bool = False  # sequential chain: each chunk sees the previous
     #   chunk's summary (better narrative continuity; ~2x slower per video,
     #   but concurrent coherent jobs are pinned to different GPUs)
@@ -193,6 +195,8 @@ def analyze_job(job_id: str, req: AnalyzeRequest, video, norm, cleanup,
         chunk_s = req.chunk_seconds or (
             DEFAULT_CHUNK_HIGH if req.quality == "high" else DEFAULT_CHUNK)
         env = dict(os.environ)
+        if req.prompt:
+            env["LAB_USER_PROMPT"] = req.prompt[:2000]
         if req.coherent:
             if backend_idx is None:
                 with jobs_lock:

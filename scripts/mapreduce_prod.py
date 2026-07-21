@@ -125,6 +125,17 @@ def main():
     print(f"split into {len(chunks)} chunks in {time.time() - t0:.1f}s")
 
     apis = alive_backends()
+    # Optional user focus: steers every chunk's attention and gets a direct
+    # answer in the merge (user_answer key).
+    user_prompt = os.environ.get("LAB_USER_PROMPT", "").strip()
+    global CHUNK_PROMPT, MERGE_PROMPT
+    if user_prompt:
+        CHUNK_PROMPT = ("PAY SPECIAL ATTENTION to this user request while "
+                        f"analyzing: {user_prompt}\n\n" + CHUNK_PROMPT)
+        MERGE_PROMPT = MERGE_PROMPT.replace(
+            '"narrative_arc": ""}',
+            '"narrative_arc": "", "user_answer": "direct answer to the user request: '
+            + user_prompt.replace('"', "'") + '"}')
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
     coherent = os.environ.get("LAB_COHERENT", "0") == "1"
