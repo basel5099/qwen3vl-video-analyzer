@@ -7,6 +7,9 @@
 # (same boot-order behavior as the RunPod template).
 set -x
 export LAB_HOME=/root/lab
+# Salad's sandboxed runtime has no CUDA UVA -> vLLM's V2 model runner
+# crashes with "UVA is not available"; force the V1 runner.
+export VLLM_USE_V2_MODEL_RUNNER=0
 
 mkdir -p $LAB_HOME/videos
 # venv shim so analyzer's/launcher's .venv paths work with the system python
