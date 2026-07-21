@@ -41,6 +41,10 @@ CHUNK_DIR = LAB / "videos" / "chunks"
 CHUNK_PROMPT = """This is one segment of a longer craft video. Analyze it and return ONLY valid JSON:
 {"segment_summary": "2-3 sentences", "materials_and_objects": [], "actions": [], "notable_moments": [{"timestamp": "mm:ss WITHIN THIS SEGMENT", "event": ""}], "craft_type": "", "authenticity_signals": ""}"""
 
+COHERENT_PREFIX = """CONTEXT FROM EARLIER IN THIS VIDEO (already analyzed): {prev}
+
+Analyze THIS segment as a CONTINUATION of that story — refer to established objects/steps where relevant, and note what is NEW or has progressed. """
+
 MERGE_PROMPT = """You are given per-segment JSON analyses of ONE long craft video, in order. Write ONE merged analysis. Do NOT output timestamps (they are handled elsewhere). Return ONLY valid JSON:
 {"summary": "3-4 sentences on the full arc", "materials_and_objects": [], "actions": [], "craft_type": "", "authenticity_impression": "", "narrative_arc": ""}
 
@@ -118,16 +122,22 @@ def main():
     print(f"split into {len(chunks)} chunks in {time.time() - t0:.1f}s")
 
     apis = alive_backends()
-    print(f"backends: {len(apis)} -> {apis}")
+    # Coherent mode: sequential chain, pinned to ONE backend so concurrent
+    # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
+    coherent = os.environ.get("LAB_COHERENT", "0") == "1"
+    if coherent:
+        idx = int(os.environ.get("LAB_BACKEND_IDX", "0"))
+        apis = [apis[idx % len(apis)]]
+    print(f"backends: {len(apis)} coherent={coherent} -> {apis}")
 
-    def analyze_chunk(idx_chunk):
+    def analyze_chunk(idx_chunk, prompt_text=CHUNK_PROMPT):
         i, chunk = idx_chunk
         t1 = time.time()
         resp = post({
             "model": MODEL,
             "messages": [{"role": "user", "content": [
                 {"type": "video_url", "video_url": {"url": f"file://{chunk}"}},
-                {"type": "text", "text": CHUNK_PROMPT},
+                {"type": "text", "text": prompt_text},
             ]}],
             "max_tokens": 2200, "temperature": 0.2,
         }, api=apis[i % len(apis)])
@@ -137,17 +147,29 @@ def main():
         print(f"chunk {i}: wall={wall:.1f}s in={u['prompt_tokens']} out={u['completion_tokens']}")
         return i, seg, u
 
+    if coherent:
+        results = []
+        prev = ""
+        for ic in enumerate(chunks):
+            ptxt = (COHERENT_PREFIX.format(prev=prev) + CHUNK_PROMPT) if prev \
+                else CHUNK_PROMPT
+            i, seg, u = analyze_chunk(ic, ptxt)
+            results.append((i, seg, u))
+            prev = str(seg.get("segment_summary", ""))[:1500]
+    else:
+        with ThreadPoolExecutor(max_workers=len(apis)) as pool:
+            results = sorted(pool.map(analyze_chunk, enumerate(chunks)))
+
     seg_reports, all_moments = [], []
     tot_in = tot_out = 0
-    with ThreadPoolExecutor(max_workers=len(apis)) as pool:
-        for i, seg, u in sorted(pool.map(analyze_chunk, enumerate(chunks))):
-            off = i * chunk_seconds
-            tot_in += u["prompt_tokens"]; tot_out += u["completion_tokens"]
-            for m in seg.get("notable_moments", []):
-                all_moments.append({"timestamp": globalize(m.get("timestamp", ""), off),
-                                    "event": m.get("event", "")})
-            seg_reports.append({"segment_index": i, "segment_start": mmss(off),
-                                "analysis": seg})
+    for i, seg, u in results:
+        off = i * chunk_seconds
+        tot_in += u["prompt_tokens"]; tot_out += u["completion_tokens"]
+        for m in seg.get("notable_moments", []):
+            all_moments.append({"timestamp": globalize(m.get("timestamp", ""), off),
+                                "event": m.get("event", "")})
+        seg_reports.append({"segment_index": i, "segment_start": mmss(off),
+                            "analysis": seg})
 
     t2 = time.time()
     merge = post({

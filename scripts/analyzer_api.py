@@ -46,6 +46,7 @@ DEFAULT_CHUNK_HIGH = 90 if _vram_mb < 40000 else 150
 app = FastAPI(title="qwen3vl-video-analyzer")
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+_coherent_counter = {"n": 0}  # round-robins coherent jobs across GPUs
 
 
 class AnalyzeRequest(BaseModel):
@@ -54,6 +55,9 @@ class AnalyzeRequest(BaseModel):
     chunk_seconds: int | None = None
     limit_seconds: int = 0
     quality: str = "low"  # "low" = 360p (fast), "high" = 720p (fine detail)
+    coherent: bool = False  # sequential chain: each chunk sees the previous
+    #   chunk's summary (better narrative continuity; ~2x slower per video,
+    #   but concurrent coherent jobs are pinned to different GPUs)
 
 
 def check_auth(authorization: str | None):
@@ -108,10 +112,17 @@ def run_job(job_id: str, req: AnalyzeRequest):
         set_job(job_id, status="running", stage="analyzing")
         chunk_s = req.chunk_seconds or (
             DEFAULT_CHUNK_HIGH if req.quality == "high" else DEFAULT_CHUNK)
+        env = dict(os.environ)
+        if req.coherent:
+            with jobs_lock:
+                idx = _coherent_counter["n"]
+                _coherent_counter["n"] += 1
+            env["LAB_COHERENT"] = "1"
+            env["LAB_BACKEND_IDX"] = str(idx)
         proc = subprocess.run(
             [str(LAB / ".venv/bin/python"), str(LAB / "mapreduce_prod.py"),
              str(norm), str(chunk_s), str(req.limit_seconds)],
-            capture_output=True, text=True, timeout=7200,
+            capture_output=True, text=True, timeout=7200, env=env,
         )
         if proc.returncode != 0:
             raise RuntimeError("analysis failed: "
