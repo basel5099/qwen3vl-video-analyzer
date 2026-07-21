@@ -2,7 +2,12 @@
 # Target: consumer NVIDIA cards (RTX 5090 32GB primary — same adaptive
 # profile as the local dual-5090 lab). No SSH: Salad only exposes the
 # Container Gateway port.
-FROM vllm/vllm-openai:v0.25.1
+# PINNED to v0.11.2: Salad nodes run containers under WSL, whose CUDA layer
+# breaks vLLM >=0.25 (V2 runner needs UVA -> "UVA is not available"; V1
+# runner dies in profiling GEMMs -> "CUDA driver error: device not ready").
+# Salad's own recipe pins v0.10.1 for the same reason; 0.11.2 is the newest
+# line proven with our stack (AMD template runs 0.11.2-dev) AND Qwen3-VL.
+FROM vllm/vllm-openai:v0.11.2
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl xz-utils && \
