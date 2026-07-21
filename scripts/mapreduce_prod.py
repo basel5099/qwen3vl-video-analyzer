@@ -107,8 +107,11 @@ def main():
         duration = min(duration, limit_seconds)
     print(f"video={video.name} duration_used={duration:.0f}s chunk={chunk_seconds}s")
 
-    CHUNK_DIR.mkdir(exist_ok=True)
-    for old in CHUNK_DIR.glob("chunk_*.mp4"):
+    # Per-video chunk dir: concurrent jobs must never share (they race and
+    # cross-contaminate each other's chunks — found the hard way).
+    chunk_dir = CHUNK_DIR.parent / f"chunks_{video.stem}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    for old in chunk_dir.glob("chunk_*.mp4"):
         old.unlink()
     t0 = time.time()
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", video]
@@ -116,9 +119,9 @@ def main():
         cmd += ["-t", str(limit_seconds)]
     cmd += ["-c", "copy", "-an", "-f", "segment",
             "-segment_time", str(chunk_seconds), "-reset_timestamps", "1",
-            CHUNK_DIR / "chunk_%03d.mp4"]
+            chunk_dir / "chunk_%03d.mp4"]
     subprocess.run(cmd, check=True)
-    chunks = sorted(CHUNK_DIR.glob("chunk_*.mp4"))
+    chunks = sorted(chunk_dir.glob("chunk_*.mp4"))
     print(f"split into {len(chunks)} chunks in {time.time() - t0:.1f}s")
 
     apis = alive_backends()
