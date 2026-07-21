@@ -37,7 +37,9 @@ try:
 except Exception:
     _vram_mb = 999999
 # Small cards run a smaller vLLM context (see launch.sh) -> smaller chunks.
+# "high" quality (720p) costs ~4x tokens/frame -> chunks shrink accordingly.
 DEFAULT_CHUNK = 180 if _vram_mb < 40000 else 600
+DEFAULT_CHUNK_HIGH = 45 if _vram_mb < 40000 else 150
 
 app = FastAPI(title="qwen3vl-video-analyzer")
 jobs: dict[str, dict] = {}
@@ -49,6 +51,7 @@ class AnalyzeRequest(BaseModel):
     video_path: str | None = None
     chunk_seconds: int | None = None
     limit_seconds: int = 0
+    quality: str = "low"  # "low" = 360p (fast), "high" = 720p (fine detail)
 
 
 def check_auth(authorization: str | None):
@@ -63,11 +66,12 @@ def set_job(job_id: str, **fields):
     (JOBS_DIR / f"{job_id}.json").write_text(json.dumps(snapshot))
 
 
-def normalize(src: Path) -> Path:
+def normalize(src: Path, quality: str = "low") -> Path:
+    scale = "1280:-2" if quality == "high" else "640:-2"
     dst = src.with_name(src.stem + "_norm.mp4")
     proc = subprocess.run(
         [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
-         "-vf", "fps=1,scale=640:-2", "-c:v", "libx264", "-preset", "veryfast",
+         "-vf", f"fps=1,scale={scale}", "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "23", "-an", str(dst)],
         capture_output=True, text=True, timeout=3600,
     )
@@ -97,10 +101,11 @@ def run_job(job_id: str, req: AnalyzeRequest):
                 raise RuntimeError("video download failed")
 
         set_job(job_id, status="running", stage="normalizing")
-        norm = normalize(video)
+        norm = normalize(video, req.quality)
 
         set_job(job_id, status="running", stage="analyzing")
-        chunk_s = req.chunk_seconds or DEFAULT_CHUNK
+        chunk_s = req.chunk_seconds or (
+            DEFAULT_CHUNK_HIGH if req.quality == "high" else DEFAULT_CHUNK)
         proc = subprocess.run(
             [str(LAB / ".venv/bin/python"), str(LAB / "mapreduce_prod.py"),
              str(norm), str(chunk_s), str(req.limit_seconds)],
