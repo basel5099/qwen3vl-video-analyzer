@@ -1,5 +1,5 @@
 #!/bin/bash
-LAB="${LAB_HOME:-$LAB}"
+LAB="${LAB_HOME:-/root/lab}"
 cd "$LAB"
 export PATH=$LAB/.venv/bin:/usr/local/cuda/bin:$PATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -23,7 +23,7 @@ fi
 MAXLEN=${1:-$DEF_MAXLEN}
 
 exec .venv/bin/vllm serve Qwen/Qwen3-VL-8B-Instruct \
-  --port 8101 --max-model-len $MAXLEN --kv-cache-dtype fp8 \
+  --port "${PORT:-8101}" --max-model-len $MAXLEN --kv-cache-dtype fp8 \
   --gpu-memory-utilization $UTIL \
   --allowed-local-media-path $LAB/videos \
   --limit-mm-per-prompt "{\"video\": 1}" \
