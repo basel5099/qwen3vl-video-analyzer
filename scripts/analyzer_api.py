@@ -37,9 +37,11 @@ try:
 except Exception:
     _vram_mb = 999999
 # Small cards run a smaller vLLM context (see launch.sh) -> smaller chunks.
-# "high" quality (720p) costs ~4x tokens/frame -> chunks shrink accordingly.
-DEFAULT_CHUNK = 180 if _vram_mb < 40000 else 600
-DEFAULT_CHUNK_HIGH = 45 if _vram_mb < 40000 else 150
+# Chunks are sized to nearly FILL the context (measured: ~100 tok/frame @360p,
+# ~300 tok/frame @720p): richer temporal context per chunk and fewer chunks
+# (each chunk pays a fixed ~9 s JSON-generation cost).
+DEFAULT_CHUNK = 360 if _vram_mb < 40000 else 600
+DEFAULT_CHUNK_HIGH = 90 if _vram_mb < 40000 else 150
 
 app = FastAPI(title="qwen3vl-video-analyzer")
 jobs: dict[str, dict] = {}
@@ -72,7 +74,7 @@ def normalize(src: Path, quality: str = "low") -> Path:
     proc = subprocess.run(
         [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
          "-vf", f"fps=1,scale={scale}", "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "23", "-an", str(dst)],
+         "-crf", "23", "-g", "15", "-an", str(dst)],
         capture_output=True, text=True, timeout=3600,
     )
     if proc.returncode != 0 or not dst.is_file() or dst.stat().st_size == 0:

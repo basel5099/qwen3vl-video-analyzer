@@ -139,7 +139,7 @@ def main():
 
     seg_reports, all_moments = [], []
     tot_in = tot_out = 0
-    with ThreadPoolExecutor(max_workers=len(apis) * 2) as pool:
+    with ThreadPoolExecutor(max_workers=len(apis)) as pool:
         for i, seg, u in sorted(pool.map(analyze_chunk, enumerate(chunks))):
             off = i * chunk_seconds
             tot_in += u["prompt_tokens"]; tot_out += u["completion_tokens"]
