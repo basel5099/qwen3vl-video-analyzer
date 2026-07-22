@@ -122,6 +122,9 @@ class AnalyzeRequest(BaseModel):
     coherent: bool = False  # sequential chain: each chunk sees the previous
     #   chunk's summary (better narrative continuity; ~2x slower per video,
     #   but concurrent coherent jobs are pinned to different GPUs)
+    output_schema: dict | list | None = None  # exact JSON template the final
+    #   answer must fill LITERALLY (same keys/nesting, no extras) — for
+    #   callers with a strict output contract
 
 
 def check_auth(authorization: str | None):
@@ -196,7 +199,9 @@ def analyze_job(job_id: str, req: AnalyzeRequest, video, norm, cleanup,
             DEFAULT_CHUNK_HIGH if req.quality == "high" else DEFAULT_CHUNK)
         env = dict(os.environ)
         if req.prompt:
-            env["LAB_USER_PROMPT"] = req.prompt[:2000]
+            env["LAB_USER_PROMPT"] = req.prompt[:12000]
+        if req.output_schema is not None:
+            env["LAB_OUTPUT_SCHEMA"] = json.dumps(req.output_schema)[:12000]
         if req.coherent:
             if backend_idx is None:
                 with jobs_lock:

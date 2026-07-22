@@ -174,6 +174,7 @@ def main():
     user_prompt = os.environ.get("LAB_USER_PROMPT", "").strip()
     global CHUNK_PROMPT, MERGE_PROMPT
     gen_prompt = ""
+    output_schema = os.environ.get("LAB_OUTPUT_SCHEMA", "").strip()
     if user_prompt:
         # PLANNER (Basel's design): first tell the model our constraint (no
         # full-video context, part-by-part analysis) and let IT write the
@@ -191,24 +192,47 @@ def main():
                 "(no JSON) with segment-local timestamps written as [mm:ss], "
                 "must ask to collect ALL evidence relevant to the request, "
                 "and must NOT ask the analyst to answer the global question "
-                "themselves. Return ONLY the instruction text."), 500)
+                "themselves. Return ONLY the instruction text."
+                + (("\nThe combined output must later fill this JSON template "
+                    "— make sure the instruction collects evidence for ALL "
+                    "its fields:\n" + output_schema[:3000])
+                   if output_schema else "")), 500)
         gen_prompt = planner_text.strip()
         print(f"planner prompt: {gen_prompt[:200]}")
         CHUNK_PROMPT = (
             gen_prompt + "\n\nAnswer in plain prose (NO JSON). Write times "
             "WITHIN THIS SEGMENT as [mm:ss].")
-        MERGE_PROMPT = (
-            f"ORIGINAL USER REQUEST about ONE long video: {user_prompt}\n"
-            f"Each segment was analyzed with this instruction: {gen_prompt}\n\n"
-            "Below are the sequential segment observations. All timestamps "
-            "in them are GLOBAL and look like [HH:MM:SS]. Produce the final "
-            "result answering the ORIGINAL USER REQUEST exactly in the form "
-            "the user asked for, and return ONLY valid JSON. Copy timestamps "
-            "EXACTLY as written: "
-            '{"user_answer": "the direct final answer in the form the user asked for", '
-            '"summary": "1-2 sentences of supporting context", '
-            '"notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}'
-            "\n\nSegment observations:\n")
+        if output_schema:
+            MERGE_PROMPT = (
+                f"ORIGINAL USER REQUEST about ONE long video: {user_prompt}\n"
+                f"Each segment was analyzed with this instruction: {gen_prompt}\n\n"
+                "Below are the sequential segment observations. All timestamps "
+                "in them are GLOBAL and look like [HH:MM:SS].\n"
+                "Your ENTIRE output must be ONLY valid JSON that fills EXACTLY "
+                "this template: identical key names and nesting, EVERY key "
+                "present, NO extra keys, no task letters, no wrapper text. "
+                "Where evidence is missing use the template's empty/zero "
+                "defaults. Fields named *_sec take NUMERIC seconds (convert "
+                "from [HH:MM:SS]); never invent timestamps not grounded in "
+                "the observations.\nTEMPLATE:\n" + output_schema +
+                "\n\nSegment observations:\n")
+        else:
+            MERGE_PROMPT = (
+                f"ORIGINAL USER REQUEST about ONE long video: {user_prompt}\n"
+                f"Each segment was analyzed with this instruction: {gen_prompt}\n\n"
+                "Below are the sequential segment observations. All timestamps "
+                "in them are GLOBAL and look like [HH:MM:SS]. Produce the final "
+                "result answering the ORIGINAL USER REQUEST exactly in the form "
+                "the user asked for, and return ONLY valid JSON. "
+                "IF the request itself defines an explicit output JSON "
+                "structure/contract, return EXACTLY that structure (verbatim "
+                "key names, all fields present, no extras) INSTEAD of the "
+                "default shape below. Copy timestamps EXACTLY as written. "
+                "Default shape: "
+                '{"user_answer": "the direct final answer in the form the user asked for", '
+                '"summary": "1-2 sentences of supporting context", '
+                '"notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}'
+                "\n\nSegment observations:\n")
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
     coherent = os.environ.get("LAB_COHERENT", "0") == "1"
@@ -263,14 +287,17 @@ def main():
     merged = extract_json(merge_text)
     # Timestamps are copy-only: drop any moment whose stamp never appears in
     # the (code-globalized) segment texts; salvage from the texts if empty.
-    valid_ts = set(m.group(1) for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input))
-    moments = [m for m in merged.get("notable_moments", [])
-               if isinstance(m, dict) and m.get("timestamp") in valid_ts]
-    if not moments:
-        moments = [{"timestamp": m.group(1),
-                    "event": merge_input[m.end():m.end() + 110].split(".")[0].strip(" -:،")}
-                   for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input)][:40]
-    merged["notable_moments"] = moments
+    # (Skipped in output_schema mode — a caller contract must come back
+    # EXACTLY as templated, with no injected keys.)
+    if not output_schema:
+        valid_ts = set(m.group(1) for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input))
+        moments = [m for m in merged.get("notable_moments", [])
+                   if isinstance(m, dict) and m.get("timestamp") in valid_ts]
+        if not moments:
+            moments = [{"timestamp": m.group(1),
+                        "event": merge_input[m.end():m.end() + 110].split(".")[0].strip(" -:،")}
+                       for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input)][:40]
+        merged["notable_moments"] = moments
 
     result = {
         "video": video.name, "duration_s": duration, "chunks": len(chunks),
