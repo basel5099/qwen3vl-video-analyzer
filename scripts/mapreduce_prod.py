@@ -125,17 +125,25 @@ def main():
     print(f"split into {len(chunks)} chunks in {time.time() - t0:.1f}s")
 
     apis = alive_backends()
-    # Optional user focus: steers every chunk's attention and gets a direct
-    # answer in the merge (user_answer key).
+    # User prompt is EXCLUSIVE: when set, it fully replaces the general craft
+    # prompts (no competing instructions). Without it, the defaults apply.
     user_prompt = os.environ.get("LAB_USER_PROMPT", "").strip()
     global CHUNK_PROMPT, MERGE_PROMPT
     if user_prompt:
-        CHUNK_PROMPT = ("PAY SPECIAL ATTENTION to this user request while "
-                        f"analyzing: {user_prompt}\n\n" + CHUNK_PROMPT)
-        MERGE_PROMPT = MERGE_PROMPT.replace(
-            '"narrative_arc": ""}',
-            '"narrative_arc": "", "user_answer": "direct answer to the user request: '
-            + user_prompt.replace('"', "'") + '"}')
+        CHUNK_PROMPT = (
+            "This is one segment of a longer video. Answer ONLY the following "
+            f"request based on what is visible in this segment: {user_prompt}\n"
+            'Return ONLY valid JSON: {"answer": "your answer for this segment", '
+            '"notable_moments": [{"timestamp": "mm:ss WITHIN THIS SEGMENT", '
+            '"event": "observation relevant to the request"}]}')
+        MERGE_PROMPT = (
+            "You are given per-segment JSON answers, in order, to this user "
+            f"request about ONE long video: {user_prompt}\n"
+            "Combine them into ONE final answer. Do NOT output timestamps "
+            "(they are handled elsewhere). Return ONLY valid JSON: "
+            '{"user_answer": "the direct final answer", '
+            '"summary": "1-2 sentences of supporting context"}'
+            "\n\nSegment answers:\n")
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
     coherent = os.environ.get("LAB_COHERENT", "0") == "1"
@@ -169,7 +177,7 @@ def main():
                 else CHUNK_PROMPT
             i, seg, u = analyze_chunk(ic, ptxt)
             results.append((i, seg, u))
-            prev = str(seg.get("segment_summary", ""))[:1500]
+            prev = str(seg.get("segment_summary") or seg.get("answer", ""))[:1500]
     else:
         with ThreadPoolExecutor(max_workers=len(apis)) as pool:
             results = sorted(pool.map(analyze_chunk, enumerate(chunks)))
