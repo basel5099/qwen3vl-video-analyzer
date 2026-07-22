@@ -69,24 +69,39 @@ GEMINI_MODEL = os.environ.get("LAB_GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def text_llm(prompt_text, max_tokens=2200):
-    """Returns (text, usage_dict). Gemini Flash if configured, else local."""
+    """Returns (text, usage_dict). Gemini Flash if configured (with 429
+    backoff), falling back to the local model so quota NEVER kills a job."""
     if GEMINI_KEY:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
-        req = urllib.request.Request(url, data=json.dumps({
+        body = json.dumps({
             "contents": [{"parts": [{"text": prompt_text}]}],
             # thinking off: with it on, thoughts eat maxOutputTokens and the
             # visible answer arrives truncated mid-JSON.
             "generationConfig": {"maxOutputTokens": max_tokens + 2000,
                                  "temperature": 0.2,
                                  "thinkingConfig": {"thinkingBudget": 0}},
-        }).encode(), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            data = json.load(r)
-        um = data.get("usageMetadata", {})
-        return (data["candidates"][0]["content"]["parts"][0]["text"],
-                {"prompt_tokens": um.get("promptTokenCount", 0),
-                 "completion_tokens": um.get("candidatesTokenCount", 0)})
+        }).encode()
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    url, data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    data = json.load(r)
+                um = data.get("usageMetadata", {})
+                return (data["candidates"][0]["content"]["parts"][0]["text"],
+                        {"prompt_tokens": um.get("promptTokenCount", 0),
+                         "completion_tokens": um.get("candidatesTokenCount", 0)})
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    print(f"gemini 429, backoff {15 * (attempt + 1)}s")
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                print(f"gemini failed ({e.code}), falling back to local")
+                break
+            except Exception as e:
+                print(f"gemini error ({e}), falling back to local")
+                break
     resp = post({"model": MODEL,
                  "messages": [{"role": "user", "content": prompt_text}],
                  "max_tokens": max_tokens, "temperature": 0.2})
