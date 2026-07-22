@@ -74,13 +74,17 @@ def text_llm(prompt_text, max_tokens=2200):
     if GEMINI_KEY:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
+        # Flash: thinking OFF (thoughts eat maxOutputTokens -> truncated JSON).
+        # Pro models REFUSE budget 0 ("only works in thinking mode") -> leave
+        # thinking on with extra headroom for the hidden thought tokens.
+        gen_cfg = {"maxOutputTokens": max_tokens + 2000, "temperature": 0.2}
+        if "flash" in GEMINI_MODEL:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        else:
+            gen_cfg["maxOutputTokens"] = max_tokens + 6000
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt_text}]}],
-            # thinking off: with it on, thoughts eat maxOutputTokens and the
-            # visible answer arrives truncated mid-JSON.
-            "generationConfig": {"maxOutputTokens": max_tokens + 2000,
-                                 "temperature": 0.2,
-                                 "thinkingConfig": {"thinkingBudget": 0}},
+            "generationConfig": gen_cfg,
         }).encode()
         for attempt in range(3):
             try:
