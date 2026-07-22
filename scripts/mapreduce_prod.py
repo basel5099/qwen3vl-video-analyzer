@@ -38,15 +38,17 @@ FFMPEG = LAB / "bin" / "ffmpeg"
 FFPROBE = LAB / "bin" / "ffprobe"
 CHUNK_DIR = LAB / "videos" / "chunks"
 
-CHUNK_PROMPT = """This is one segment of a longer craft video. Analyze it and return ONLY valid JSON:
-{"segment_summary": "2-3 sentences", "materials_and_objects": [], "actions": [], "notable_moments": [{"timestamp": "mm:ss WITHIN THIS SEGMENT", "event": ""}], "craft_type": "", "authenticity_signals": ""}"""
+# Chunks answer in PROSE (never JSON): per-chunk JSON breaks too easily
+# (truncation, format drift) and the damage travels through the pipeline.
+# JSON is built exactly ONCE, in the final merge step.
+CHUNK_PROMPT = """This is one segment of a longer craft video. Describe it in detailed prose (plain text, NO JSON, no markdown): what happens step by step, the materials and objects used, the actions performed, what craft is being practiced, and any authenticity signals (real-time hands, cuts, overlays). Whenever you reference a specific moment, write its time WITHIN THIS SEGMENT as [mm:ss]."""
 
 COHERENT_PREFIX = """CONTEXT FROM EARLIER IN THIS VIDEO (already analyzed): {prev}
 
 Analyze THIS segment as a CONTINUATION of that story — refer to established objects/steps where relevant, and note what is NEW or has progressed. """
 
-MERGE_PROMPT = """You are given per-segment JSON analyses of ONE long craft video, in order. Write ONE merged analysis. Do NOT output timestamps (they are handled elsewhere). Return ONLY valid JSON:
-{"summary": "3-4 sentences on the full arc", "materials_and_objects": [], "actions": [], "craft_type": "", "authenticity_impression": "", "narrative_arc": ""}
+MERGE_PROMPT = """You are given sequential prose analyses of ONE long craft video. All timestamps in them are GLOBAL and look like [HH:MM:SS]. Write ONE merged analysis and return ONLY valid JSON. Copy timestamps EXACTLY as written — never invent or recompute them:
+{"summary": "3-4 sentences on the full arc", "materials_and_objects": [], "actions": [], "craft_type": "", "authenticity_impression": "", "narrative_arc": "", "notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}
 
 Segment analyses:
 """
@@ -93,6 +95,15 @@ def extract_json(text):
         return {"raw": text}
 
 
+TS_PAT = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+
+
+def globalize_text(text, offset_s):
+    """Rewrite every [mm:ss] in chunk prose to global [HH:MM:SS] — in code,
+    so the merge model only ever COPIES timestamps, never computes them."""
+    return TS_PAT.sub(lambda m: "[" + globalize(m.group(1), offset_s) + "]", text)
+
+
 def main():
     video = Path(sys.argv[1])
     chunk_seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 600
@@ -131,18 +142,19 @@ def main():
     global CHUNK_PROMPT, MERGE_PROMPT
     if user_prompt:
         CHUNK_PROMPT = (
-            "This is one segment of a longer video. Answer ONLY the following "
-            f"request based on what is visible in this segment: {user_prompt}\n"
-            'Return ONLY valid JSON: {"answer": "your answer for this segment", '
-            '"notable_moments": [{"timestamp": "mm:ss WITHIN THIS SEGMENT", '
-            '"event": "observation relevant to the request"}]}')
+            "This is one segment of a longer video. Address ONLY the following "
+            f"request, based on what is visible in this segment: {user_prompt}\n"
+            "Answer in plain prose (NO JSON). When you reference a specific "
+            "moment, write its time WITHIN THIS SEGMENT as [mm:ss].")
         MERGE_PROMPT = (
-            "You are given per-segment JSON answers, in order, to this user "
-            f"request about ONE long video: {user_prompt}\n"
-            "Combine them into ONE final answer. Do NOT output timestamps "
-            "(they are handled elsewhere). Return ONLY valid JSON: "
+            "You are given sequential prose answers to this user request "
+            f"about ONE long video: {user_prompt}\n"
+            "All timestamps in them are GLOBAL and look like [HH:MM:SS]. "
+            "Combine them into ONE final answer and return ONLY valid JSON. "
+            "Copy timestamps EXACTLY as written: "
             '{"user_answer": "the direct final answer", '
-            '"summary": "1-2 sentences of supporting context"}'
+            '"summary": "1-2 sentences of supporting context", '
+            '"notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}'
             "\n\nSegment answers:\n")
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
@@ -165,9 +177,9 @@ def main():
         }, api=apis[i % len(apis)])
         wall = time.time() - t1
         u = resp["usage"]
-        seg = extract_json(resp["choices"][0]["message"]["content"])
+        seg_text = resp["choices"][0]["message"]["content"].strip()
         print(f"chunk {i}: wall={wall:.1f}s in={u['prompt_tokens']} out={u['completion_tokens']}")
-        return i, seg, u
+        return i, seg_text, u
 
     if coherent:
         results = []
@@ -175,34 +187,42 @@ def main():
         for ic in enumerate(chunks):
             ptxt = (COHERENT_PREFIX.format(prev=prev) + CHUNK_PROMPT) if prev \
                 else CHUNK_PROMPT
-            i, seg, u = analyze_chunk(ic, ptxt)
-            results.append((i, seg, u))
-            prev = str(seg.get("segment_summary") or seg.get("answer", ""))[:1500]
+            i, seg_text, u = analyze_chunk(ic, ptxt)
+            results.append((i, seg_text, u))
+            prev = seg_text[:1500]
     else:
         with ThreadPoolExecutor(max_workers=len(apis)) as pool:
             results = sorted(pool.map(analyze_chunk, enumerate(chunks)))
 
-    seg_reports, all_moments = [], []
+    seg_reports = []
     tot_in = tot_out = 0
-    for i, seg, u in results:
+    merge_input = ""
+    for i, seg_text, u in results:
         off = i * chunk_seconds
         tot_in += u["prompt_tokens"]; tot_out += u["completion_tokens"]
-        for m in seg.get("notable_moments", []):
-            all_moments.append({"timestamp": globalize(m.get("timestamp", ""), off),
-                                "event": m.get("event", "")})
+        gtext = globalize_text(seg_text, off)  # [mm:ss] -> [HH:MM:SS], in code
         seg_reports.append({"segment_index": i, "segment_start": mmss(off),
-                            "analysis": seg})
+                            "analysis_text": gtext})
+        merge_input += f"\n--- segment {i} (starts {mmss(off)}) ---\n{gtext}\n"
 
     t2 = time.time()
     merge = post({
         "model": MODEL,
-        "messages": [{"role": "user",
-                      "content": MERGE_PROMPT + json.dumps(seg_reports, indent=1)}],
-        "max_tokens": 2000, "temperature": 0.2,
+        "messages": [{"role": "user", "content": MERGE_PROMPT + merge_input}],
+        "max_tokens": 2200, "temperature": 0.2,
     })
     mu = merge["usage"]
     merged = extract_json(merge["choices"][0]["message"]["content"])
-    merged["notable_moments"] = all_moments  # code-side, correct global timestamps
+    # Timestamps are copy-only: drop any moment whose stamp never appears in
+    # the (code-globalized) segment texts; salvage from the texts if empty.
+    valid_ts = set(m.group(1) for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input))
+    moments = [m for m in merged.get("notable_moments", [])
+               if isinstance(m, dict) and m.get("timestamp") in valid_ts]
+    if not moments:
+        moments = [{"timestamp": m.group(1),
+                    "event": merge_input[m.end():m.end() + 110].split(".")[0].strip(" -:،")}
+                   for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input)][:40]
+    merged["notable_moments"] = moments
 
     result = {
         "video": video.name, "duration_s": duration, "chunks": len(chunks),
