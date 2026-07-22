@@ -62,6 +62,34 @@ def post(payload, timeout=1800, api=None):
         return json.load(r)
 
 
+# Text-only reasoning (planner + final decision) goes to Gemini Flash when a
+# key is configured; the local vision model only ever SEES video segments.
+GEMINI_KEY = os.environ.get("LAB_GEMINI_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("LAB_GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def text_llm(prompt_text, max_tokens=2200):
+    """Returns (text, usage_dict). Gemini Flash if configured, else local."""
+    if GEMINI_KEY:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
+        req = urllib.request.Request(url, data=json.dumps({
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens,
+                                 "temperature": 0.2},
+        }).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            data = json.load(r)
+        um = data.get("usageMetadata", {})
+        return (data["candidates"][0]["content"]["parts"][0]["text"],
+                {"prompt_tokens": um.get("promptTokenCount", 0),
+                 "completion_tokens": um.get("candidatesTokenCount", 0)})
+    resp = post({"model": MODEL,
+                 "messages": [{"role": "user", "content": prompt_text}],
+                 "max_tokens": max_tokens, "temperature": 0.2})
+    return resp["choices"][0]["message"]["content"], resp["usage"]
+
+
 def mmss(s):
     return f"{int(s) // 60:02d}:{int(s) % 60:02d}"
 
@@ -145,9 +173,7 @@ def main():
         # PLANNER (Basel's design): first tell the model our constraint (no
         # full-video context, part-by-part analysis) and let IT write the
         # per-segment evidence-gathering instruction for the user's request.
-        planner = post({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": (
+        planner_text, _pu = text_llm((
                 "A user wants the following from a long video:\n"
                 f"USER REQUEST: {user_prompt}\n\n"
                 "Constraint: the video cannot be analyzed in one piece. It is "
@@ -160,10 +186,8 @@ def main():
                 "(no JSON) with segment-local timestamps written as [mm:ss], "
                 "must ask to collect ALL evidence relevant to the request, "
                 "and must NOT ask the analyst to answer the global question "
-                "themselves. Return ONLY the instruction text.")}],
-            "max_tokens": 500, "temperature": 0.2,
-        }, api=apis[0])
-        gen_prompt = planner["choices"][0]["message"]["content"].strip()
+                "themselves. Return ONLY the instruction text."), 500)
+        gen_prompt = planner_text.strip()
         print(f"planner prompt: {gen_prompt[:200]}")
         CHUNK_PROMPT = (
             gen_prompt + "\n\nAnswer in plain prose (NO JSON). Write times "
@@ -230,13 +254,8 @@ def main():
         merge_input += f"\n--- segment {i} (starts {mmss(off)}) ---\n{gtext}\n"
 
     t2 = time.time()
-    merge = post({
-        "model": MODEL,
-        "messages": [{"role": "user", "content": MERGE_PROMPT + merge_input}],
-        "max_tokens": 2200, "temperature": 0.2,
-    })
-    mu = merge["usage"]
-    merged = extract_json(merge["choices"][0]["message"]["content"])
+    merge_text, mu = text_llm(MERGE_PROMPT + merge_input, 2200)
+    merged = extract_json(merge_text)
     # Timestamps are copy-only: drop any moment whose stamp never appears in
     # the (code-globalized) segment texts; salvage from the texts if empty.
     valid_ts = set(m.group(1) for m in re.finditer(r"\[(\d{2}:\d{2}:\d{2})\]", merge_input))
@@ -259,6 +278,7 @@ def main():
     }
     if gen_prompt:
         result["planner_prompt"] = gen_prompt
+    result["text_model"] = GEMINI_MODEL if GEMINI_KEY else "local"
     out_path.write_text(json.dumps(result, indent=1))
     print(f"TOTAL={result['total_wall_s']}s map_in={tot_in} map_out={tot_out}")
     print(f"saved -> {out_path}")
