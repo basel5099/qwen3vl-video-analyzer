@@ -75,8 +75,11 @@ def text_llm(prompt_text, max_tokens=2200):
                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
         req = urllib.request.Request(url, data=json.dumps({
             "contents": [{"parts": [{"text": prompt_text}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens,
-                                 "temperature": 0.2},
+            # thinking off: with it on, thoughts eat maxOutputTokens and the
+            # visible answer arrives truncated mid-JSON.
+            "generationConfig": {"maxOutputTokens": max_tokens + 2000,
+                                 "temperature": 0.2,
+                                 "thinkingConfig": {"thinkingBudget": 0}},
         }).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as r:
             data = json.load(r)
@@ -111,6 +114,8 @@ def globalize(ts_local, offset_s):
 
 
 def extract_json(text):
+    # strip markdown code fences (```json ... ```) some models wrap JSON in
+    text = re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", text.strip())
     try:
         return json.loads(text)
     except Exception:
