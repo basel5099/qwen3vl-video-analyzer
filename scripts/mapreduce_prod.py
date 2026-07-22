@@ -140,22 +140,46 @@ def main():
     # prompts (no competing instructions). Without it, the defaults apply.
     user_prompt = os.environ.get("LAB_USER_PROMPT", "").strip()
     global CHUNK_PROMPT, MERGE_PROMPT
+    gen_prompt = ""
     if user_prompt:
+        # PLANNER (Basel's design): first tell the model our constraint (no
+        # full-video context, part-by-part analysis) and let IT write the
+        # per-segment evidence-gathering instruction for the user's request.
+        planner = post({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": (
+                "A user wants the following from a long video:\n"
+                f"USER REQUEST: {user_prompt}\n\n"
+                "Constraint: the video cannot be analyzed in one piece. It is "
+                "split into sequential segments, each analyzed in isolation "
+                "by a vision model that sees ONLY that segment; the outputs "
+                "are combined afterwards to answer the user.\n"
+                "Write the single best instruction to give EACH segment "
+                "analyst so that the combined observations fully answer the "
+                "user. The instruction must ask for plain-prose observations "
+                "(no JSON) with segment-local timestamps written as [mm:ss], "
+                "must ask to collect ALL evidence relevant to the request, "
+                "and must NOT ask the analyst to answer the global question "
+                "themselves. Return ONLY the instruction text.")}],
+            "max_tokens": 500, "temperature": 0.2,
+        }, api=apis[0])
+        gen_prompt = planner["choices"][0]["message"]["content"].strip()
+        print(f"planner prompt: {gen_prompt[:200]}")
         CHUNK_PROMPT = (
-            "This is one segment of a longer video. Address ONLY the following "
-            f"request, based on what is visible in this segment: {user_prompt}\n"
-            "Answer in plain prose (NO JSON). When you reference a specific "
-            "moment, write its time WITHIN THIS SEGMENT as [mm:ss].")
+            gen_prompt + "\n\nAnswer in plain prose (NO JSON). Write times "
+            "WITHIN THIS SEGMENT as [mm:ss].")
         MERGE_PROMPT = (
-            "You are given sequential prose answers to this user request "
-            f"about ONE long video: {user_prompt}\n"
-            "All timestamps in them are GLOBAL and look like [HH:MM:SS]. "
-            "Combine them into ONE final answer and return ONLY valid JSON. "
-            "Copy timestamps EXACTLY as written: "
-            '{"user_answer": "the direct final answer", '
+            f"ORIGINAL USER REQUEST about ONE long video: {user_prompt}\n"
+            f"Each segment was analyzed with this instruction: {gen_prompt}\n\n"
+            "Below are the sequential segment observations. All timestamps "
+            "in them are GLOBAL and look like [HH:MM:SS]. Produce the final "
+            "result answering the ORIGINAL USER REQUEST exactly in the form "
+            "the user asked for, and return ONLY valid JSON. Copy timestamps "
+            "EXACTLY as written: "
+            '{"user_answer": "the direct final answer in the form the user asked for", '
             '"summary": "1-2 sentences of supporting context", '
             '"notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}'
-            "\n\nSegment answers:\n")
+            "\n\nSegment observations:\n")
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
     coherent = os.environ.get("LAB_COHERENT", "0") == "1"
@@ -233,6 +257,8 @@ def main():
         "merge_gen_tokens": mu["completion_tokens"],
         "merged_analysis": merged, "segment_reports": seg_reports,
     }
+    if gen_prompt:
+        result["planner_prompt"] = gen_prompt
     out_path.write_text(json.dumps(result, indent=1))
     print(f"TOTAL={result['total_wall_s']}s map_in={tot_in} map_out={tot_out}")
     print(f"saved -> {out_path}")
