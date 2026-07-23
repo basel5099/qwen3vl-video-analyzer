@@ -62,15 +62,47 @@ def post(payload, timeout=1800, api=None):
         return json.load(r)
 
 
-# Text-only reasoning (planner + final decision) goes to Gemini Flash when a
-# key is configured; the local vision model only ever SEES video segments.
+# Text-only reasoning (planner + final decision): pluggable brain.
+# LAB_TEXT_PROVIDER=codex -> Codex CLI (ChatGPT-subscription models, e.g.
+# gpt-5.6-luna); else Gemini when LAB_GEMINI_KEY is set; else the local model.
 GEMINI_KEY = os.environ.get("LAB_GEMINI_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("LAB_GEMINI_MODEL", "gemini-2.5-flash")
+TEXT_PROVIDER = os.environ.get("LAB_TEXT_PROVIDER", "").strip().lower()
+CODEX_MODEL = os.environ.get("LAB_CODEX_MODEL", "").strip()
+
+
+def _codex_llm(prompt_text):
+    """One non-interactive Codex turn; returns the final message text."""
+    import tempfile
+    fd, out_path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only",
+           "--output-last-message", out_path]
+    if CODEX_MODEL:
+        cmd += ["-m", CODEX_MODEL]
+    cmd.append(prompt_text)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=600, cwd=str(LAB))
+        text = Path(out_path).read_text(encoding="utf-8").strip()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+    if not text:
+        raise RuntimeError("codex exec returned empty output")
+    return text
 
 
 def text_llm(prompt_text, max_tokens=2200):
-    """Returns (text, usage_dict). Gemini Flash if configured (with 429
-    backoff), falling back to the local model so quota NEVER kills a job."""
+    """Returns (text, usage_dict). Provider-pluggable (codex/gemini/local);
+    every remote failure falls back to the local model so no job dies."""
+    if TEXT_PROVIDER == "codex":
+        try:
+            return _codex_llm(prompt_text), {"prompt_tokens": 0,
+                                             "completion_tokens": 0}
+        except Exception as e:
+            print(f"codex failed ({e}), falling back")
     if GEMINI_KEY:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
@@ -342,7 +374,10 @@ def main():
     }
     if gen_prompt:
         result["planner_prompt"] = gen_prompt
-    result["text_model"] = GEMINI_MODEL if GEMINI_KEY else "local"
+    if TEXT_PROVIDER == "codex":
+        result["text_model"] = f"codex:{CODEX_MODEL or 'config-default'}"
+    else:
+        result["text_model"] = GEMINI_MODEL if GEMINI_KEY else "local"
     out_path.write_text(json.dumps(result, indent=1))
     print(f"TOTAL={result['total_wall_s']}s map_in={tot_in} map_out={tot_out}")
     print(f"saved -> {out_path}")
