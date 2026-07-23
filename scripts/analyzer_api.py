@@ -198,6 +198,8 @@ def analyze_job(job_id: str, req: AnalyzeRequest, video, norm, cleanup,
         chunk_s = req.chunk_seconds or (
             DEFAULT_CHUNK_HIGH if req.quality == "high" else DEFAULT_CHUNK)
         env = dict(os.environ)
+        # audio lives only in the ORIGINAL file (normalize strips it)
+        env["LAB_AUDIO_SRC"] = str(video)
         if req.prompt:
             env["LAB_USER_PROMPT"] = req.prompt[:12000]
         if req.output_schema is not None:

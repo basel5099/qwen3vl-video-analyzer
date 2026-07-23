@@ -94,6 +94,69 @@ def _codex_llm(prompt_text):
     return text
 
 
+# The EAR: Gemini Flash natively listens to the soundtrack (the vision model
+# is structurally deaf — vLLM feeds it frames only). Audio comes from the
+# ORIGINAL file (LAB_AUDIO_SRC, set by the API) since normalize strips it.
+AUDIO_SRC = os.environ.get("LAB_AUDIO_SRC", "").strip()
+AUDIO_MODEL = os.environ.get("LAB_AUDIO_MODEL", "gemini-2.5-flash")
+
+
+def has_audio_stream():
+    if not (GEMINI_KEY and AUDIO_SRC and Path(AUDIO_SRC).is_file()):
+        return False
+    probe = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", AUDIO_SRC],
+        capture_output=True, text=True)
+    return "audio" in probe.stdout
+
+
+def analyze_audio(instruction, limit_s=0):
+    """Extract light mono audio, let Gemini Flash listen. Prose or None."""
+    import base64
+    mp3 = LAB / "videos" / (Path(AUDIO_SRC).stem + "_ear.mp3")
+    try:
+        for bitrate in ("32k", "16k"):
+            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", AUDIO_SRC]
+            if limit_s:
+                cmd += ["-t", str(limit_s)]
+            cmd += ["-vn", "-ac", "1", "-b:a", bitrate, str(mp3)]
+            subprocess.run(cmd, capture_output=True, timeout=1800)
+            if not mp3.is_file() or mp3.stat().st_size == 0:
+                return None
+            if mp3.stat().st_size <= 18_000_000:  # inline-request headroom
+                break
+        b64 = base64.b64encode(mp3.read_bytes()).decode()
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{AUDIO_MODEL}:generateContent?key={GEMINI_KEY}")
+        body = json.dumps({
+            "contents": [{"parts": [
+                {"inline_data": {"mime_type": "audio/mp3", "data": b64}},
+                {"text": instruction}]}],
+            "generationConfig": {"maxOutputTokens": 3000, "temperature": 0.2,
+                                 "thinkingConfig": {"thinkingBudget": 0}},
+        }).encode()
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url, data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    data = json.load(r)
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt == 0:
+                    time.sleep(20)
+                    continue
+                print(f"audio analysis failed ({e.code})")
+                return None
+    except Exception as e:
+        print(f"audio analysis error: {e}")
+        return None
+    finally:
+        mp3.unlink(missing_ok=True)
+
+
 def text_llm(prompt_text, max_tokens=2200):
     """Returns (text, usage_dict). Provider-pluggable (codex/gemini/local);
     every remote failure falls back to the local model so no job dies."""
@@ -297,6 +360,35 @@ def main():
                 '"summary": "1-2 sentences of supporting context", '
                 '"notable_moments": [{"timestamp": "HH:MM:SS", "event": ""}]}'
                 "\n\nSegment observations:\n")
+    # THE EAR (runs in parallel with the vision chunks): the text brain
+    # writes the listening instruction; Gemini Flash does the listening.
+    audio_future = None
+    audio_instr = ""
+    if has_audio_stream():
+        if user_prompt:
+            audio_instr, _au = text_llm((
+                "A user wants the following from a long video:\n"
+                f"USER REQUEST: {user_prompt}\n\n"
+                "A separate AUDIO model will LISTEN to the full soundtrack "
+                "(it cannot see the picture). Write the single best "
+                "instruction for it: simple concrete language, plain-prose "
+                "observations of everything heard that is relevant to the "
+                "request (speech, music, ambient sound, hand-work vs machine "
+                "sounds), with timestamps written as [hh:mm:ss]. It must "
+                "only report what it hears, not answer the global question. "
+                "Return ONLY the instruction text."), 400)
+            audio_instr = audio_instr.strip()
+        else:
+            audio_instr = (
+                "Listen to this soundtrack and describe it in plain prose: "
+                "speech (what is said, and the language), music, ambient "
+                "sounds, and whether work sounds are HAND work or MACHINE "
+                "work. Give timestamps as [hh:mm:ss] for notable audio "
+                "events.")
+        _audio_pool = ThreadPoolExecutor(max_workers=1)
+        audio_future = _audio_pool.submit(analyze_audio, audio_instr,
+                                          limit_seconds)
+
     # Coherent mode: sequential chain, pinned to ONE backend so concurrent
     # jobs (other videos) get the other GPUs. LAB_BACKEND_IDX set by the API.
     coherent = os.environ.get("LAB_COHERENT", "0") == "1"
@@ -346,6 +438,18 @@ def main():
                             "analysis_text": gtext})
         merge_input += f"\n--- segment {i} (starts {mmss(off)}) ---\n{gtext}\n"
 
+    audio_text = None
+    if audio_future is not None:
+        try:
+            audio_text = audio_future.result(timeout=600)
+        except Exception as e:
+            print(f"audio future failed: {e}")
+    if audio_text:
+        merge_input += ("\n--- AUDIO ANALYSIS (from a separate model that "
+                        "LISTENED to the full soundtrack; it cannot see the "
+                        "picture; its [hh:mm:ss] timestamps are global) ---\n"
+                        + audio_text + "\n")
+
     t2 = time.time()
     merge_text, mu = text_llm(MERGE_PROMPT + merge_input, 2200)
     merged = extract_json(merge_text)
@@ -374,6 +478,9 @@ def main():
     }
     if gen_prompt:
         result["planner_prompt"] = gen_prompt
+    if audio_text:
+        result["audio_analysis"] = audio_text
+        result["audio_prompt"] = audio_instr
     if TEXT_PROVIDER == "codex":
         result["text_model"] = f"codex:{CODEX_MODEL or 'config-default'}"
     else:
